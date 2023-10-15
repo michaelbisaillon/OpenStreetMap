@@ -1,0 +1,232 @@
+---
+title: "Extraction de données sur les entreprises avec OSM - Le cas de la ville de Chambly"
+format: html
+editor: visual
+---
+
+Auteur: Michaël Bisaillon
+
+Date: 15 octobre 2023
+
+## Objectif
+
+L'objectif est de documenter le processus d'extraction de données sur les entreprises dans une ville avec OpenStreetMap (OSM) alors qu'il n'existe aucune données officielles disponibles au préalable. Nous entendons par données officielles des données ouvertes offertes par la municipalité.
+
+Pour arriver à nos fins, nous allons utiliser R et les paquets suivants:
+
+```{r, message = FALSE, warning= FALSE}
+
+library(sf) 
+library(tidyverse)
+library(janitor)
+library(osmdata)
+library(leaflet)
+library(RColorBrewer)
+library(skimr)
+```
+
+Le paquet osmdata nous permet de télécharger directement les données d'OSM.
+
+## 1. Choisir une ville
+
+La première étape est de choisir une ville à étudier. Dans notre exemple, nous allons prendre la ville de Chambly au Québec.
+
+## 2. Déterminer les limites géographiques
+
+La première chose à faire, c'est de connaître les limites géographique de la ville de Chambly. Pour ce faire, il est possible de trouver sur le [site web de Statistiques Canada](https://www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/index2021-fra.cfm?year=21) le fichiers des limites des subdivisions de recensement (SDR), qui corresponds aux territoires des différentes villes au Canada. Voici la définition d'une SDR:
+
+> *Une municipalité ou une région jugée équivalente à des fins statistiques (p. ex., une réserve indienne ou un territoire non organisé). Le statut de municipalité est défini par les lois en vigueur dans chaque province et territoire au Canada.*
+>
+> *Source: [Statistiques Canada](https://www12.statcan.gc.ca/census-recensement/2011/ref/dict/geo012-fra.cfm)*
+
+Nous avons téléchargé et décompressé le fichier des SDR dans un sous-dossier du projet intitulé 'data'. Une fois fait, il faut filtrer le fichier pour extraire les limites de la ville de Chambly.
+
+```{r, message = FALSE, warning=FALSE}
+
+# Charger le fichier et nettoyer le formatage des noms de colonnes
+SDR <- st_read("data//lsdr000b21a_f//lsdr000b21a_f.shp", quiet = TRUE) |> 
+  clean_names()
+
+#Filtrer la SDR de la ville de Chambly
+SDR.chambly <- SDR |> 
+  filter(sdrnom == "Chambly")
+
+# Reprojeter de NAD83 / Statistics Canada Lambert à EPSG:4326
+SDR.chambly <- st_transform(SDR.chambly, crs = 4326)
+
+#Visualiser le territoire de Chambly
+leaflet() |> 
+  addProviderTiles(providers$CartoDB.Positron) |> 
+   addPolygons(data = SDR.chambly, 
+              color = "black", 
+              opacity = 1, 
+              weight = 1, 
+              fillOpacity = 0)
+
+
+#exporter les résultats
+#st_write(SDR.chambly, "data//SDR_chambly.gpkg")
+
+```
+
+## 3. Extraction des données sur les commerces
+
+Il est maintenant temps d'interroger la base de données d'OSM pour extraire les données de commerces sur Chambly.
+
+```{r, message=FALSE, warning=FALSE}
+
+#création d'une fonction pour effectuer plusieurs requête en même temps à l'aide du
+#paquet osmdata
+get_osm_data <- function(key, bbox) {
+  
+  # Créer la requête
+  query <- opq(bbox = bbox) %>%
+    add_osm_feature(key = key)
+  
+  # Obtenir les données en tant que 'sf'
+  data_sf <- osmdata_sf(query)
+  
+      # Colonnes à conserver
+    common_cols <- c("osm_id", "name", "addr:housenumber", "addr:street", "key", "geometry")
+    
+    # Ajouter les colonnes manquantes si une catégorie n'en possède pas
+  for (col in common_cols) {
+    if (!(col %in% names(data_sf$osm_points))) {
+      data_sf$osm_points <- data_sf$osm_points %>% mutate(!!col := NA)
+    }
+  }
+     # Ajouter une colonne pour identifier les catégories
+  data_sf$osm_points$key <- key
+  
+    # On conserve les données en points et les colonnes necessaires
+  data_sf$osm_points[, common_cols, drop = FALSE]
+  
+}
+
+# Définir la requête pour Chambly à l'aide du paquet osmdata
+bbox <- getbb("Chambly, Québec, Canada") 
+
+# Liste des catégories à interroger
+keys <- c("shop", "office", "amenity", "craft", "healthcare", "leisure", "tourism", "emergency")
+ 
+# Obtenir les résultats
+results_list <- map(keys, function(key) get_osm_data(key, bbox))
+
+# Filtrer les éléments key null
+results_list <- discard(results_list, is.null)
+
+#combiner les résultats
+chambly_data_sf <- bind_rows(results_list) |> clean_names()
+
+# Éliminer les points qui servent de noeuds de bâtiments
+chambly_data_sf <- chambly_data_sf |> 
+  filter(!is.na(name)) |> 
+  distinct(osm_id, .keep_all = TRUE) 
+
+
+# Effectuer une intersection des données avec le territoire de Chambly pour retirer
+# les données qui seraient hors zone
+sf_use_s2(FALSE)
+SDR.chambly <- SDR.chambly |>  select(geometry)
+chambly_data_sf <- st_intersection(chambly_data_sf, SDR.chambly)
+
+
+
+
+```
+
+## 4. Exploration des données
+
+Nous allons utiliser le paquet skimr pour inspecter le jeu de données.
+
+Les résultats nous indique que nous avons un jeu de données avec 203 lignes et 6 colonnes, toutes en format texte (character). On remarque plus bas qu'il manque beaucoup d'informations sur les adresses avec 145 données manquantes.
+
+```{r, message=FALSE, warning=FALSE}
+
+skim(chambly_data_sf)
+
+
+```
+
+### Des catégories imparfaites
+
+Si l'on regarde le nombre de commerces par catégorie, on remarque plusieurs problèmes. Le nombre de bureaux (office) et entreprises dans le domaine de la santé (healthcare) semblent sous-estimés. Il y a peut-être des chevauchement entre les autres catégories.
+
+Regardons de plus près comment OSM définit les différentes catégories:
+
+> Amenity: Used to map facilities used by visitors and residents. For example: toilets, telephones, banks, pharmacies, cafes, parking and schools
+>
+> Healthcare: Also see Map features #Healthcare which includes healthcare features under amenity=\*. There is a full list of healthcare features at Healthcare.
+>
+> Leisure: This is used to tag leisure and sports facilities.
+>
+> Office: An office is a place of business where administrative or professional work is carried out.
+>
+> Shop: The shop tag is used as a place of business that has stocked goods for sale or sells services.
+>
+> Tourism: This is used to map places and things of specific interest to tourists. For example these may be places to see, places to stay and things and places providing support.
+>
+> Source: <https://wiki.openstreetmap.org/wiki/Map_features>
+
+On voit que certaines entreprises dans le domaine de la santé peuvent aussi être regroupés avec 'Amenity' et que certains services comme les banques pourraient aussi bien se trouver dans les bureaux. Il y aussi des commerces qui sont parfois dans une catégories, parfois dans une autre comme le Pétro-Canada qui est classé dans 'Shop' et Esso dans 'Amenity'. Finalement, si on se concentre sur les entreprises, il y aurait certaines données à éliminer comme les écluses qui sont dans la catégorie 'Tourism'. Le mieux ici serait d'adopter une catégorisation personnalisée pour chacune des entreprises mais ce n'est pas le but de l'exercice.
+
+```{r, message=FALSE, warning=FALSE}
+
+#nombre de commerces par catégorie (key)
+
+nombre_par_categorie <- chambly_data_sf |> 
+  st_drop_geometry() |> 
+  group_by(key) |> 
+  count() |> 
+  arrange(desc(n)) |> 
+  print()
+
+```
+
+### Les principales rues commerçantes
+
+Si l'on se fie au jeu de données, le Boulevard de Périgny serait le lieu principal de l'activité commerciale. Toutefois, avec 145 données manquantes sur un jeu de données de 203 entrées, il est périlleux de se fier au jeu de données pour identifier les principales rues commerçantes.
+
+```{r, message=FALSE, warning=FALSE}
+
+nombre_rue <- chambly_data_sf |> 
+  st_drop_geometry() |> 
+  group_by(addr_street) |> 
+  count() |> 
+  arrange(desc(n)) |> 
+  print()
+
+```
+
+### Visualisation des données
+
+Nous allons visualiser les données avec une carte leaflet. Les nombreux points sur le Boulevard de Périgny semble confirmer qu'il s'agit de la principale artère de la Ville avec l'Avenue Bourgogne. On remarque aussi une grappe d'entreprise à l'intersection du Boulevard Anne-Le-Seigneur et du Boulevard Fréchette.
+
+```{r, message=FALSE, warning=FALSE}
+
+
+#visualiser les résultats sur une carte leaflet
+leaflet() |> 
+  addProviderTiles(providers$CartoDB.Positron) |> 
+  addPolygons(data = SDR.chambly, 
+              color = "black", 
+              opacity = 1, 
+              weight = 1, 
+              fillOpacity = 0) |>
+  addCircleMarkers(data = chambly_data_sf,
+                   popup = ~name, 
+                   radius = 5,
+                   color = "white",
+                   weight = 1,
+                   fillColor = "dodgerblue",
+                   opacity = 0.75,
+                   fillOpacity = 0.75
+)
+
+# Exporter les résultats
+#st_write(chambly_data_sf, "data//commerces_chambly.gpkg")
+
+# Sauvegarder une version du document en PDF
+renderthis::to_pdf("collect_documentation.html")
+
+```
