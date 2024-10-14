@@ -1,4 +1,4 @@
-# Guide OpenStreetMap
+# Guide d'utilisation de l'API OpenStreetMap avec R
 
 Ce dépôt contient des ressources pour apprendre à utiliser l'API R de OpenStreetMap et du package osmdata à l'aide d'un exemple avec l'extraction des commerces de la ville de Chambly. Le guide est disponible en ligne à l'adresse suivante : [michaelbisaillon.github.io/OpenStreetMap](https://michaelbisaillon.github.io/OpenStreetMap/).
 
